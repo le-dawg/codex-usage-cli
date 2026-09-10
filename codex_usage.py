@@ -15,6 +15,8 @@ import shutil
 import sqlite3
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -70,7 +72,10 @@ COMMAND_HELP = {
     },
 }
 
-PRICING = {
+DEFAULT_REMOTE_PRICING_URL = "https://raw.githubusercontent.com/le-dawg/codex-usage-cli/main/pricing.json"
+REMOTE_PRICING_TIMEOUT_SECONDS = 3.0
+
+PRICING_BASE = {
     "gpt-5": (1.25e-6, 1e-5, 1.25e-7),
     "gpt-5-codex": (1.25e-6, 1e-5, 1.25e-7),
     "gpt-5-mini": (2.5e-7, 2e-6, 2.5e-8),
@@ -94,6 +99,11 @@ PRICING = {
     "gpt-5.5": (5e-6, 3e-5, 5e-7),
     "gpt-5.5-pro": (3e-5, 1.8e-4, None),
 }
+PRICING = dict(PRICING_BASE)
+PRICING_SOURCE = "builtin"
+PRICING_SOURCE_URL: str | None = None
+PRICING_FETCHED_AT: str | None = None
+PRICING_ERROR: str | None = None
 
 # Energy heuristic rates are intentionally rough. They provide a consistent
 # relative signal from local token counts rather than a wall-power measurement.
@@ -284,6 +294,7 @@ class UsageReport:
     plan_types: list[str]
     limits: LimitSnapshot | None
     diagnostics: ScanDiagnostics
+    pricing: dict[str, object]
 
 
 class TerminalUI:
@@ -406,6 +417,93 @@ def as_bool(value: object) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def parse_rate_per_token(value: object) -> float | None:
+    numeric = as_float(value)
+    if numeric is None or numeric < 0:
+        return None
+    return numeric / 1_000_000.0
+
+
+def parse_remote_pricing_models(payload: object) -> dict[str, tuple[float, float, float | None]]:
+    if not isinstance(payload, dict):
+        return {}
+    raw_models = payload.get("models", payload)
+    if not isinstance(raw_models, dict):
+        return {}
+
+    parsed: dict[str, tuple[float, float, float | None]] = {}
+    for model_name, rates in raw_models.items():
+        if not isinstance(model_name, str):
+            continue
+        if not isinstance(rates, dict):
+            continue
+        input_rate = parse_rate_per_token(rates.get("input_per_1m_usd"))
+        output_rate = parse_rate_per_token(rates.get("output_per_1m_usd"))
+        if input_rate is None or output_rate is None:
+            continue
+        cached_value = rates.get("cached_input_per_1m_usd")
+        cached_rate = None if cached_value is None else parse_rate_per_token(cached_value)
+        if cached_value is not None and cached_rate is None:
+            continue
+        parsed[model_name] = (input_rate, output_rate, cached_rate)
+    return parsed
+
+
+def refresh_runtime_pricing(pricing_url: str | None) -> dict[str, object]:
+    global PRICING, PRICING_SOURCE, PRICING_SOURCE_URL, PRICING_FETCHED_AT, PRICING_ERROR
+
+    PRICING = dict(PRICING_BASE)
+    PRICING_SOURCE = "builtin"
+    PRICING_SOURCE_URL = None
+    PRICING_FETCHED_AT = None
+    PRICING_ERROR = None
+    metadata: dict[str, object] = {
+        "source": PRICING_SOURCE,
+        "url": None,
+        "fetched_at": None,
+        "model_count": len(PRICING),
+        "error": None,
+    }
+
+    if not pricing_url:
+        metadata["source"] = "builtin-disabled"
+        return metadata
+
+    try:
+        with urllib.request.urlopen(pricing_url, timeout=REMOTE_PRICING_TIMEOUT_SECONDS) as response:
+            body = response.read()
+        payload = json.loads(body.decode("utf-8"))
+        parsed_models = parse_remote_pricing_models(payload)
+        if not parsed_models:
+            raise ValueError("remote pricing payload had no valid models")
+        PRICING.update(parsed_models)
+        PRICING_SOURCE = "remote"
+        PRICING_SOURCE_URL = pricing_url
+        PRICING_FETCHED_AT = datetime.now().astimezone().isoformat(timespec="seconds")
+        metadata.update(
+            {
+                "source": PRICING_SOURCE,
+                "url": PRICING_SOURCE_URL,
+                "fetched_at": PRICING_FETCHED_AT,
+                "model_count": len(PRICING),
+                "error": None,
+            }
+        )
+        return metadata
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+        PRICING_ERROR = str(exc)
+        metadata.update(
+            {
+                "source": "builtin-fallback",
+                "url": pricing_url,
+                "fetched_at": None,
+                "model_count": len(PRICING),
+                "error": PRICING_ERROR,
+            }
+        )
+        return metadata
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Local Codex Usage Viewer",
@@ -484,6 +582,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Hide thread titles in dashboard and JSON output.",
     )
     parser.add_argument(
+        "--pricing-url",
+        type=str,
+        default=os.environ.get("CUV_PRICING_URL", DEFAULT_REMOTE_PRICING_URL),
+        help=(
+            "Remote pricing JSON URL used to refresh heuristic model rates at runtime. "
+            "Use an empty value to disable remote pricing refresh."
+        ),
+    )
+    parser.add_argument(
         "--version",
         "-v",
         action="version",
@@ -543,6 +650,7 @@ def print_command_help(parser: argparse.ArgumentParser, topic: str | None) -> No
             "  --json                     Emit machine-readable JSON",
             "  --censored                 Hide thread titles and local path",
             "  --no-cost                  Hide heuristic cost estimates",
+            "  --pricing-url URL          Runtime pricing JSON source",
             "  --root /path/to/codex-home Scan a different Codex home",
         ]
     )
@@ -1114,6 +1222,7 @@ def build_report(
     until: date | None,
     events: list[UsageEvent],
     diagnostics: ScanDiagnostics,
+    pricing_metadata: dict[str, object],
 ) -> UsageReport:
     summary, daily, models, sessions = aggregate(events)
     plan_types = sorted({event.plan_type for event in events if event.plan_type})
@@ -1148,6 +1257,7 @@ def build_report(
         plan_types=plan_types,
         limits=limits,
         diagnostics=diagnostics,
+        pricing=pricing_metadata,
     )
 
 
@@ -1690,6 +1800,11 @@ def build_notes_panel(report: UsageReport, ui: TerminalUI, *, censored: bool) ->
         footer_lines.append(
             "Costs prefixed with ~ include fallback prices guessed from the nearest known model family."
         )
+    pricing_source = report.pricing.get("source")
+    if pricing_source == "remote":
+        footer_lines.append("Pricing rates were refreshed from remote JSON for this run.")
+    elif pricing_source == "builtin-fallback":
+        footer_lines.append("Remote pricing refresh failed; using builtin fallback rates for this run.")
     return ui.panel("Notes", footer_lines, color="gray")
 
 
@@ -1875,6 +1990,7 @@ def build_json_report(report: UsageReport, *, censored: bool) -> dict:
         "window": {"since": report.since, "until": report.until},
         "summary": {**asdict(report.summary), "tree_offset_hours": report.summary.tree_offset_hours},
         "plan_types": report.plan_types,
+        "pricing": report.pricing,
         "limits": asdict(report.limits) if report.limits is not None else None,
         "diagnostics": asdict(report.diagnostics),
         "daily": {
@@ -1923,6 +2039,7 @@ def build_focused_json_report(
         "window": {"since": report.since, "until": report.until},
         "summary": {**asdict(report.summary), "tree_offset_hours": report.summary.tree_offset_hours},
         "plan_types": report.plan_types,
+        "pricing": report.pricing,
         "limits": asdict(report.limits) if report.limits is not None else None,
         "diagnostics": asdict(report.diagnostics),
     }
@@ -2038,6 +2155,7 @@ def ui_enabled(args: argparse.Namespace) -> bool:
 def run_once(args: argparse.Namespace, ui: TerminalUI) -> UsageReport:
     root = args.root.expanduser()
     since, until = choose_window(args)
+    pricing_metadata = refresh_runtime_pricing(args.pricing_url.strip())
     events, diagnostics = collect_events(
         root,
         since,
@@ -2046,7 +2164,7 @@ def run_once(args: argparse.Namespace, ui: TerminalUI) -> UsageReport:
         progress=ui.update_progress if ui.enabled else None,
     )
     ui.finish_progress()
-    return build_report(root, since, until, events, diagnostics)
+    return build_report(root, since, until, events, diagnostics, pricing_metadata)
 
 
 def render_plain_or_json(report: UsageReport, args: argparse.Namespace, ui: TerminalUI) -> str:
