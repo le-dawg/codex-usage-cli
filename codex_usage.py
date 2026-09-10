@@ -137,12 +137,21 @@ TREE_ABSORPTION_G_CO2E_PER_YEAR = 22_000.0
 
 MODEL_DATE_SUFFIX = re.compile(r"-\d{4}-\d{2}-\d{2}$")
 MODEL_REASONING_SUFFIX = re.compile(r"-(low|medium|high|xhigh)$")
+MODEL_TRAILING_NOISE_SUFFIX = re.compile(r"-(latest|stable|snapshot)$")
 GPT_VERSION_RE = re.compile(r"^gpt-(\d+(?:\.\d+)?)(.*)$")
 SESSION_ID_RE = re.compile(
     r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
     re.IGNORECASE,
 )
 FILENAME_DAY_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
+MODEL_ALIASES = {
+    "gpt6": "gpt-6",
+    "gpt6-astra": "gpt-6-astra",
+    "gpt-6.0": "gpt-6",
+    "gpt-6.0-astra": "gpt-6-astra",
+    "gpt-6-astra-preview": "gpt-6-astra",
+}
 
 
 @dataclass
@@ -424,6 +433,23 @@ def parse_rate_per_token(value: object) -> float | None:
     return numeric / 1_000_000.0
 
 
+def canonicalize_model_name(raw: str | None) -> str:
+    if not raw:
+        return "unknown"
+    model = raw.strip().lower()
+    for prefix in ("openai/", "openai:", "models/", "model:"):
+        while model.startswith(prefix):
+            model = model.removeprefix(prefix)
+    model = model.replace("_", "-")
+    model = re.sub(r"\s+", "-", model)
+    model = re.sub(r"-{2,}", "-", model).strip("-")
+    return model or "unknown"
+
+
+def apply_model_alias(model: str) -> str:
+    return MODEL_ALIASES.get(model, model)
+
+
 def parse_remote_pricing_models(payload: object) -> dict[str, tuple[float, float, float | None]]:
     if not isinstance(payload, dict):
         return {}
@@ -437,6 +463,9 @@ def parse_remote_pricing_models(payload: object) -> dict[str, tuple[float, float
             continue
         if not isinstance(rates, dict):
             continue
+        normalized_model = apply_model_alias(canonicalize_model_name(model_name))
+        if not normalized_model or normalized_model == "unknown":
+            continue
         input_rate = parse_rate_per_token(rates.get("input_per_1m_usd"))
         output_rate = parse_rate_per_token(rates.get("output_per_1m_usd"))
         if input_rate is None or output_rate is None:
@@ -445,7 +474,7 @@ def parse_remote_pricing_models(payload: object) -> dict[str, tuple[float, float
         cached_rate = None if cached_value is None else parse_rate_per_token(cached_value)
         if cached_value is not None and cached_rate is None:
             continue
-        parsed[model_name] = (input_rate, output_rate, cached_rate)
+        parsed[normalized_model] = (input_rate, output_rate, cached_rate)
     return parsed
 
 
@@ -867,8 +896,14 @@ def parse_limit_window(payload: object) -> LimitWindow | None:
 
 
 def strip_model_suffixes(model: str) -> str:
-    stripped = MODEL_DATE_SUFFIX.sub("", model)
-    return MODEL_REASONING_SUFFIX.sub("", stripped)
+    stripped = model
+    while True:
+        updated = MODEL_DATE_SUFFIX.sub("", stripped)
+        updated = MODEL_REASONING_SUFFIX.sub("", updated)
+        updated = MODEL_TRAILING_NOISE_SUFFIX.sub("", updated)
+        if updated == stripped:
+            return updated
+        stripped = updated
 
 
 def pricing_variant(model: str) -> str:
@@ -915,6 +950,12 @@ def guess_pricing(model: str) -> tuple[float, float, float | None] | None:
     if variant == "spark":
         return PRICING.get("gpt-5.3-codex-spark-preview")
 
+    if major_version == 6:
+        for key in ("gpt-6-astra", "gpt-6"):
+            pricing = PRICING.get(key)
+            if pricing is not None and not all(rate == 0.0 for rate in pricing if rate is not None):
+                return pricing
+
     candidate_variants = {"base"} if variant == "codex" else {variant}
     candidates = [
         (key, pricing)
@@ -929,14 +970,10 @@ def guess_pricing(model: str) -> tuple[float, float, float | None] | None:
 
 
 def normalize_model(raw: str | None) -> str:
-    if not raw:
-        return "unknown"
-    model = raw.strip()
-    if model.startswith("openai/"):
-        model = model.removeprefix("openai/")
+    model = apply_model_alias(canonicalize_model_name(raw))
     if model in PRICING:
         return model
-    stripped = strip_model_suffixes(model)
+    stripped = apply_model_alias(strip_model_suffixes(model))
     if stripped in PRICING or guess_pricing(stripped) is not None:
         return stripped
     return model
