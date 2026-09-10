@@ -20,6 +20,7 @@ This is for users and companies that have Codex analytics turned off but still w
 - `--watch` mode for live refresh.
 - `--json` mode for scripting and automation.
 - `--censored` mode to hide thread titles.
+- Runtime pricing refresh from remote JSON on each run (with offline fallback).
 - Model breakdowns, session summaries, daily usage, heuristic cost estimates, and a rough energy/tree-offset signal.
 
 ## Requirements
@@ -83,6 +84,16 @@ Then verify:
 ```bash
 cuv --version
 ```
+
+### `uvx` (ephemeral run)
+
+Run directly without a local install:
+
+```bash
+uvx --from git+https://github.com/uricorn/local-codex-usage-viewer.git cuv
+```
+
+`cuv` refreshes pricing from the repository `pricing.json` on startup, so `uvx` runs pick up pricing updates automatically. If the remote request fails, builtin fallback rates are used for that run.
 
 ### Fallback: `pip`
 
@@ -204,23 +215,32 @@ Scans a different Codex home directory instead of the default `~/.codex` or `$CO
 - Limit progress may be missing if the local logs do not contain a recent rate-limit snapshot.
 - The dashboard is useful for observability and rough comparisons, not billing reconciliation.
 - `--censored` removes thread titles and hides the local source path from terminal and JSON output.
+- JSON output includes a `pricing` object with `source`, `url`, `fetched_at`, `model_count`, and `error` fields.
 
 ### Cost Heuristic Footnote
 
-The cost estimate uses local token counts and the model prices in `PRICING` inside `codex_usage.py`.
-Each tuple is:
+The cost estimate uses local token counts and runtime model prices loaded from:
+
+1. `--pricing-url` (or `CUV_PRICING_URL`) JSON source at startup.
+2. Builtin fallback `PRICING_BASE` in `codex_usage.py` when remote refresh fails or is disabled.
+
+Remote pricing JSON expects per-1M token fields:
 
 ```text
-(input_token_rate, output_token_rate, cached_input_token_rate)
+input_per_1m_usd
+output_per_1m_usd
+cached_input_per_1m_usd
 ```
 
-Rates are stored per token. To add a new official model price, divide the published per-1M token price by `1_000_000` and add the normalized model name:
+`cuv` converts per-1M fields into per-token rates internally.
 
-```python
-PRICING["gpt-example"] = (2.5e-6, 1.5e-5, 2.5e-7)
+To disable remote pricing refresh for a run:
+
+```bash
+cuv --pricing-url ""
 ```
 
-Use `None` for `cached_input_token_rate` when cached input has no separate published price. If a future GPT model is missing from the table, `cuv` falls back to the nearest known GPT model family and marks the displayed cost with `~`; JSON output also includes `has_guessed_cost`.
+If a future GPT model is missing from the loaded pricing table, `cuv` falls back to the nearest known GPT model family and marks the displayed cost with `~`; JSON output also includes `has_guessed_cost`.
 
 ### Energy Heuristic Footnote
 
