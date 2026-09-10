@@ -1794,11 +1794,11 @@ def build_notes_panel(report: UsageReport, ui: TerminalUI, *, censored: bool) ->
             "Energy and tree offset use a token-weighted heuristic."
             " They are not wall-power measurements."
         ),
-        "Estimated cost uses a local heuristic. Treat it as relative guidance, not billing truth.",
+        "Estimated cost uses runtime pricing refresh when available, with builtin fallback rates.",
     ]
     if report.summary.has_guessed_cost:
         footer_lines.append(
-            "Costs prefixed with ~ include fallback prices guessed from the nearest known model family."
+            "Costs prefixed with ~ include guessed fallback rates from the nearest known model family."
         )
     pricing_source = report.pricing.get("source")
     if pricing_source == "remote":
