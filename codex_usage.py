@@ -105,6 +105,19 @@ PRICING_SOURCE_URL: str | None = None
 PRICING_FETCHED_AT: str | None = None
 PRICING_ERROR: str | None = None
 
+# Azure OpenAI GPT-5.4 Global Standard SKU (pay-as-you-go, no data-zone residency surcharge)
+# Standard Tier (<= 272,000 context tokens):
+#   Input: $2.50 / 1M -> 2.50e-6 per token
+#   Cached Input: $0.25 / 1M (90% discount) -> 2.50e-7 per token
+#   Output: $15.00 / 1M -> 1.50e-5 per token
+# Long Context Surcharge Tier (> 272,000 context tokens):
+#   Input: $5.00 / 1M (2x) -> 5.00e-6 per token
+#   Cached Input: $0.50 / 1M (2x) -> 5.00e-7 per token
+#   Output: $22.50 / 1M (1.5x) -> 2.25e-5 per token
+DEFAULT_CLAUDE_CONTEXT_THRESHOLD = 272_000
+AZURE_GPT54_EU_STD_RATES = (2.50e-6, 1.50e-5, 2.50e-7)
+AZURE_GPT54_EU_LONG_RATES = (5.00e-6, 2.25e-5, 5.00e-7)
+
 # Energy heuristic rates are intentionally rough. They provide a consistent
 # relative signal from local token counts rather than a wall-power measurement.
 BASE_ENERGY_RATES_WH = (2.5e-4, 7.5e-4, 2.5e-5)
@@ -277,6 +290,56 @@ class LimitSnapshot:
 
 
 @dataclass
+class ClaudeSessionAggregate:
+    session_id: str
+    project_dir: str
+    first_seen: str | None = None
+    last_seen: str | None = None
+    first_day: str | None = None
+    last_day: str | None = None
+    turns: int = 0
+    uncached_input_tokens: int = 0
+    cached_input_tokens: int = 0
+    output_tokens: int = 0
+    max_context: int = 0
+    standard_turns: int = 0
+    long_turns: int = 0
+    estimated_energy_wh: float = 0.0
+    estimated_cost_usd: float = 0.0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.uncached_input_tokens + self.cached_input_tokens + self.output_tokens
+
+    @property
+    def cached_ratio(self) -> float:
+        total_in = self.uncached_input_tokens + self.cached_input_tokens
+        return (self.cached_input_tokens / total_in) if total_in > 0 else 0.0
+
+    @property
+    def tier_label(self) -> str:
+        if self.long_turns > 0:
+            return f"long ({self.long_turns}x)"
+        return "standard"
+
+
+@dataclass
+class ClaudeReport:
+    root: str
+    since: str | None
+    until: str | None
+    summary: Aggregate
+    daily: dict[str, Aggregate]
+    daily_session_counts: dict[str, int]
+    daily_turns: dict[str, int]
+    daily_long_turns: dict[str, int]
+    sessions: dict[str, ClaudeSessionAggregate]
+    diagnostics: ScanDiagnostics
+    threshold: int
+    pricing_desc: str = "Azure OpenAI GPT-5.4 Global Standard (Adaptive)"
+
+
+@dataclass
 class UsageReport:
     root: str
     generated_at: str
@@ -295,6 +358,8 @@ class UsageReport:
     limits: LimitSnapshot | None
     diagnostics: ScanDiagnostics
     pricing: dict[str, object]
+    claude: ClaudeReport | None = None
+
 
 
 class TerminalUI:
@@ -589,6 +654,24 @@ def build_parser() -> argparse.ArgumentParser:
             "Remote pricing JSON URL used to refresh heuristic model rates at runtime. "
             "Use an empty value to disable remote pricing refresh."
         ),
+    )
+    parser.add_argument(
+        "-claude",
+        "--claude",
+        action="store_true",
+        help="Include Claude Code session usage and separate cost tables (using Azure GPT-5.4 Global Standard pricing).",
+    )
+    parser.add_argument(
+        "--claude-root",
+        type=Path,
+        default=Path(os.environ.get("CLAUDE_HOME", "~/.claude")).expanduser(),
+        help="Claude Code home directory. Defaults to $CLAUDE_HOME or ~/.claude.",
+    )
+    parser.add_argument(
+        "--claude-threshold",
+        type=int,
+        default=DEFAULT_CLAUDE_CONTEXT_THRESHOLD,
+        help=f"Context token threshold for Azure GPT-5.4 Global Standard pricing adaptation (default: {DEFAULT_CLAUDE_CONTEXT_THRESHOLD}).",
     )
     parser.add_argument(
         "--version",
@@ -1843,6 +1926,376 @@ def build_compact_period_panel(
     return ui.panel(title, panel_table.splitlines(), color=color)
 
 
+def scan_claude_code_sessions(
+    claude_root: Path,
+    since: date | None,
+    until: date | None,
+    threshold: int = DEFAULT_CLAUDE_CONTEXT_THRESHOLD,
+    with_cost: bool = True,
+) -> ClaudeReport:
+    claude_root = claude_root.expanduser()
+    projects_dir = claude_root / "projects"
+    diagnostics = ScanDiagnostics()
+    summary = Aggregate()
+    daily: dict[str, Aggregate] = defaultdict(Aggregate)
+    daily_session_sets: dict[str, set[str]] = defaultdict(set)
+    daily_turns: dict[str, int] = defaultdict(int)
+    daily_long_turns: dict[str, int] = defaultdict(int)
+    sessions: dict[str, ClaudeSessionAggregate] = {}
+
+    if not projects_dir.is_dir():
+        return ClaudeReport(
+            root=str(claude_root),
+            since=since.isoformat() if since else None,
+            until=until.isoformat() if until else None,
+            summary=summary,
+            daily=daily,
+            daily_session_counts={},
+            daily_turns={},
+            daily_long_turns={},
+            sessions={},
+            diagnostics=diagnostics,
+            threshold=threshold,
+        )
+
+    jsonl_files = sorted(projects_dir.glob("*/*.jsonl"))
+    diagnostics.discovered_files = len(jsonl_files)
+
+    for path in jsonl_files:
+        diagnostics.scanned_files += 1
+        seen_msg_ids: set[str] = set()
+        session_id = path.stem
+        session_events_count = 0
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fp:
+                for raw_line in fp:
+                    raw_line = raw_line.strip()
+                    if not raw_line:
+                        continue
+                    try:
+                        record = json.loads(raw_line)
+                    except Exception:
+                        diagnostics.invalid_lines += 1
+                        continue
+
+                    if record.get("type") != "assistant":
+                        continue
+                    msg = record.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    usage = msg.get("usage")
+                    if not isinstance(usage, dict):
+                        continue
+
+                    mid = msg.get("id") or record.get("uuid")
+                    if mid:
+                        if mid in seen_msg_ids:
+                            continue
+                        seen_msg_ids.add(mid)
+
+                    ts_raw = record.get("timestamp") or ""
+                    day_str = parse_local_day(ts_raw)
+                    if not day_str:
+                        continue
+
+                    if since is not None and day_str < since.isoformat():
+                        continue
+                    if until is not None and day_str > until.isoformat():
+                        continue
+
+                    uncached_in = as_int(usage.get("input_tokens")) + as_int(usage.get("cache_creation_input_tokens"))
+                    cached_in = as_int(usage.get("cache_read_input_tokens"))
+                    out_tok = as_int(usage.get("output_tokens"))
+                    context_size = uncached_in + cached_in
+
+                    is_long = context_size > threshold
+                    if with_cost:
+                        rates = AZURE_GPT54_EU_LONG_RATES if is_long else AZURE_GPT54_EU_STD_RATES
+                        cost = uncached_in * rates[0] + cached_in * rates[2] + out_tok * rates[1]
+                    else:
+                        cost = 0.0
+
+                    energy_wh = estimate_energy("gpt-5.4", uncached_in, cached_in, out_tok)
+
+                    cwd = record.get("cwd") or path.parent.name
+                    if session_id not in sessions:
+                        sessions[session_id] = ClaudeSessionAggregate(
+                            session_id=session_id,
+                            project_dir=cwd,
+                        )
+
+                    sess = sessions[session_id]
+                    sess.turns += 1
+                    sess.uncached_input_tokens += uncached_in
+                    sess.cached_input_tokens += cached_in
+                    sess.output_tokens += out_tok
+                    sess.estimated_energy_wh += energy_wh
+                    sess.estimated_cost_usd += cost
+                    sess.first_seen = earlier_timestamp(sess.first_seen, ts_raw)
+                    sess.last_seen = later_timestamp(sess.last_seen, ts_raw)
+                    sess.first_day = min(filter(None, [sess.first_day, day_str]), default=day_str)
+                    sess.last_day = max(filter(None, [sess.last_day, day_str]), default=day_str)
+                    if context_size > sess.max_context:
+                        sess.max_context = context_size
+                    if is_long:
+                        sess.long_turns += 1
+                    else:
+                        sess.standard_turns += 1
+
+                    summary.input_tokens += uncached_in + cached_in
+                    summary.cached_input_tokens += cached_in
+                    summary.output_tokens += out_tok
+                    summary.events += 1
+                    summary.estimated_energy_wh += energy_wh
+                    if with_cost:
+                        summary.estimated_cost_usd += cost
+                        summary.has_cost = True
+
+                    d_agg = daily[day_str]
+                    d_agg.input_tokens += uncached_in + cached_in
+                    d_agg.cached_input_tokens += cached_in
+                    d_agg.output_tokens += out_tok
+                    d_agg.events += 1
+                    d_agg.estimated_energy_wh += energy_wh
+                    if with_cost:
+                        d_agg.estimated_cost_usd += cost
+                        d_agg.has_cost = True
+
+                    daily_session_sets[day_str].add(session_id)
+                    daily_turns[day_str] += 1
+                    if is_long:
+                        daily_long_turns[day_str] += 1
+
+                    session_events_count += 1
+                    diagnostics.parsed_events += 1
+
+        except OSError:
+            diagnostics.invalid_lines += 1
+
+        if session_events_count == 0:
+            diagnostics.empty_sessions += 1
+
+    return ClaudeReport(
+        root=str(claude_root),
+        since=since.isoformat() if since else None,
+        until=until.isoformat() if until else None,
+        summary=summary,
+        daily=daily,
+        daily_session_counts={d: len(s) for d, s in daily_session_sets.items()},
+        daily_turns=daily_turns,
+        daily_long_turns=daily_long_turns,
+        sessions=sessions,
+        diagnostics=diagnostics,
+        threshold=threshold,
+    )
+
+
+def build_claude_cards(claude: ClaudeReport, with_cost: bool) -> list[tuple[str, str, str, str]]:
+    cards = [
+        ("Claude Sessions", format_int(len(claude.sessions)), "unique project sessions", "blue"),
+        ("Active Days", format_int(len(claude.daily)), "days with claude usage", "cyan"),
+        ("Claude Tokens", format_compact_int(claude.summary.total_tokens), "prompt + output", "green"),
+        ("Cached Ratio", format_percent(claude.summary.cached_ratio), "cached / prompt", "yellow"),
+        ("Long Ctx Turns", format_int(sum(claude.daily_long_turns.values())), f">{claude.threshold // 1000}k tokens (2x tier)", "magenta"),
+        ("Est. Energy", format_energy(claude.summary.estimated_energy_wh), "gpt-5.4 heuristic", "red"),
+    ]
+    if with_cost:
+        cost_value = format_cost(claude.summary.estimated_cost_usd if claude.summary.has_cost else None)
+        subtitle = "Azure GPT-5.4 Global Std"
+        cards.append(("Claude Cost", cost_value, subtitle, "magenta"))
+    else:
+        cards.append(("Output Tokens", format_compact_int(claude.summary.output_tokens), "completion tokens", "magenta"))
+    return cards
+
+
+def build_claude_session_rows(
+    claude: ClaudeReport,
+    *,
+    with_cost: bool,
+    limit: int | None,
+    unicode_ok: bool,
+    censored: bool,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    sorted_sess = sorted(
+        claude.sessions.values(),
+        key=lambda s: (s.estimated_cost_usd if with_cost else s.total_tokens, s.total_tokens),
+        reverse=True,
+    )
+    if limit is not None:
+        sorted_sess = sorted_sess[:limit]
+
+    for s in sorted_sess:
+        row = [
+            format_short_datetime(s.last_seen or s.last_day),
+            shorten_middle(s.project_dir, 38) if not censored else "[hidden]",
+            format_int(s.turns),
+            format_int(s.total_tokens),
+            format_percent(s.cached_ratio),
+            format_compact_int(s.max_context),
+            s.tier_label,
+        ]
+        if with_cost:
+            row.append(format_cost(s.estimated_cost_usd))
+        if not censored:
+            row.append(shorten_middle(s.session_id, 16))
+        rows.append(row)
+    return rows
+
+
+def build_claude_daily_rows(
+    claude: ClaudeReport,
+    *,
+    with_cost: bool,
+    limit: int | None,
+    unicode_ok: bool,
+) -> list[list[str]]:
+    rows: list[list[str]] = []
+    days = sorted(claude.daily.keys(), reverse=True)
+    if limit is not None:
+        days = days[:limit]
+
+    for d in days:
+        agg = claude.daily[d]
+        sess_count = claude.daily_session_counts.get(d, 0)
+        turns = claude.daily_turns.get(d, 0)
+        long_t = claude.daily_long_turns.get(d, 0)
+        tier_str = f"long ({long_t}x)" if long_t > 0 else "standard"
+        uncached_val = agg.input_tokens - agg.cached_input_tokens
+        row = [
+            format_pretty_day(d),
+            format_int(sess_count),
+            format_int(turns),
+            format_int(max(0, uncached_val)),
+            format_int(agg.cached_input_tokens),
+            format_int(agg.output_tokens),
+            format_int(agg.total_tokens),
+            tier_str,
+        ]
+        if with_cost:
+            row.append(format_cost(agg.estimated_cost_usd))
+        rows.append(row)
+    return rows
+
+
+def build_claude_dashboard_panels(
+    claude: ClaudeReport,
+    ui: TerminalUI,
+    *,
+    with_cost: bool,
+    limit: int,
+    daily_limit: int,
+    censored: bool,
+) -> list[str]:
+    unicode_ok = not ui.enabled or os.environ.get("TERM", "") != "dumb"
+    panels: list[str] = []
+
+    pricing_note = f"{claude.pricing_desc} (threshold: {claude.threshold // 1000}k tokens)"
+    title_lines = [
+        f"Pricing model: {pricing_note}",
+        (
+            f"Scanned {claude.diagnostics.scanned_files}/{claude.diagnostics.discovered_files} session files"
+            f" • {claude.diagnostics.parsed_events} assistant turns"
+        ),
+    ]
+    panels.append(ui.panel("Claude Code Usage (Azure GPT-5.4 Global Std)", title_lines, color="blue"))
+    panels.append(ui.cards(build_claude_cards(claude, with_cost)))
+
+    daily_rows = build_claude_daily_rows(claude, with_cost=with_cost, limit=daily_limit, unicode_ok=unicode_ok)
+    if daily_rows:
+        headers = ["Day", "Sess", "Turns", "Uncached", "Cached", "Output", "Total", "Tier"]
+        align_right = {1, 2, 3, 4, 5, 6}
+        if with_cost:
+            headers.append("Est. Cost")
+            align_right.add(8)
+        table_str = render_table(headers, daily_rows, align_right=align_right)
+        panels.append(ui.panel("Claude Code Daily", table_str.splitlines(), color="green"))
+
+    sess_rows = build_claude_session_rows(claude, with_cost=with_cost, limit=limit, unicode_ok=unicode_ok, censored=censored)
+    if sess_rows:
+        headers = ["Last Seen", "Project / CWD", "Turns", "Total", "Cached%", "Max Ctx", "Tier"]
+        align_right = {2, 3, 4, 5}
+        if with_cost:
+            headers.append("Est. Cost")
+            align_right.add(7)
+        if not censored:
+            headers.append("Session")
+        table_str = render_table(headers, sess_rows, align_right=align_right)
+        panels.append(ui.panel("Claude Code Sessions", table_str.splitlines(), color="blue"))
+
+    return panels
+
+
+def build_claude_daily_panel(
+    claude: ClaudeReport,
+    ui: TerminalUI,
+    *,
+    with_cost: bool,
+    limit: int | None,
+) -> str | None:
+    unicode_ok = not ui.enabled or os.environ.get("TERM", "") != "dumb"
+    daily_rows = build_claude_daily_rows(claude, with_cost=with_cost, limit=limit, unicode_ok=unicode_ok)
+    if not daily_rows:
+        return None
+    headers = ["Day", "Sess", "Turns", "Uncached", "Cached", "Output", "Total", "Tier"]
+    align_right = {1, 2, 3, 4, 5, 6}
+    if with_cost:
+        headers.append("Est. Cost")
+        align_right.add(8)
+    table_str = render_table(headers, daily_rows, align_right=align_right)
+    return ui.panel("Claude Code Daily Usage (Azure GPT-5.4 Global Std)", table_str.splitlines(), color="blue")
+
+
+def build_claude_sessions_panel(
+    claude: ClaudeReport,
+    ui: TerminalUI,
+    *,
+    with_cost: bool,
+    limit: int | None,
+    censored: bool,
+) -> str | None:
+    unicode_ok = not ui.enabled or os.environ.get("TERM", "") != "dumb"
+    sess_rows = build_claude_session_rows(claude, with_cost=with_cost, limit=limit, unicode_ok=unicode_ok, censored=censored)
+    if not sess_rows:
+        return None
+    headers = ["Last Seen", "Project / CWD", "Turns", "Total", "Cached%", "Max Ctx", "Tier"]
+    align_right = {2, 3, 4, 5}
+    if with_cost:
+        headers.append("Est. Cost")
+        align_right.add(7)
+    if not censored:
+        headers.append("Session")
+    table_str = render_table(headers, sess_rows, align_right=align_right)
+    return ui.panel("Claude Code Sessions (Azure GPT-5.4 Global Std)", table_str.splitlines(), color="blue")
+
+
+def build_claude_json(claude: ClaudeReport, *, censored: bool) -> dict:
+    return {
+        "pricing_desc": claude.pricing_desc,
+        "threshold": claude.threshold,
+        "root": None if censored else claude.root,
+        "summary": {**asdict(claude.summary), "tree_offset_hours": claude.summary.tree_offset_hours},
+        "daily": {
+            key: {
+                **asdict(val),
+                "turns": claude.daily_turns.get(key, 0),
+                "long_turns": claude.daily_long_turns.get(key, 0),
+                "sessions": claude.daily_session_counts.get(key, 0),
+            }
+            for key, val in sorted(claude.daily.items())
+        },
+        "sessions": {
+            key: {
+                **asdict(val),
+                "project_dir": None if censored else val.project_dir,
+            }
+            for key, val in sorted(claude.sessions.items())
+        },
+        "diagnostics": asdict(claude.diagnostics),
+    }
+
+
 def build_dashboard(
     report: UsageReport,
     ui: TerminalUI,
@@ -1916,6 +2369,18 @@ def build_dashboard(
         session_table = render_table(headers, session_rows, align_right=align_right)
         lines.append(ui.panel("Top Sessions", session_table.splitlines(), color="magenta"))
 
+    if report.claude is not None:
+        lines.extend(
+            build_claude_dashboard_panels(
+                report.claude,
+                ui,
+                with_cost=with_cost,
+                limit=limit,
+                daily_limit=daily_limit,
+                censored=censored,
+            )
+        )
+
     lines.append(build_notes_panel(report, ui, censored=censored))
     return "\n\n".join(lines)
 
@@ -1931,6 +2396,10 @@ def render_daily_report(report: UsageReport, ui: TerminalUI, *, with_cost: bool,
             headers.append("Est. Cost")
             align_right.add(10)
         lines.append(ui.panel("Daily Report", render_table(headers, rows, align_right=align_right).splitlines(), color="green"))
+    if report.claude is not None:
+        c_daily = build_claude_daily_panel(report.claude, ui, with_cost=with_cost, limit=limit)
+        if c_daily:
+            lines.append(c_daily)
     lines.append(build_notes_panel(report, ui, censored=censored))
     return "\n\n".join(lines)
 
@@ -1978,12 +2447,16 @@ def render_sessions_report(report: UsageReport, ui: TerminalUI, *, with_cost: bo
         if not censored:
             headers.append("Thread")
         lines.append(ui.panel("Sessions Report", render_table(headers, rows, align_right=align_right).splitlines(), color="magenta"))
+    if report.claude is not None:
+        c_sess = build_claude_sessions_panel(report.claude, ui, with_cost=with_cost, limit=limit, censored=censored)
+        if c_sess:
+            lines.append(c_sess)
     lines.append(build_notes_panel(report, ui, censored=censored))
     return "\n\n".join(lines)
 
 
 def build_json_report(report: UsageReport, *, censored: bool) -> dict:
-    return {
+    payload = {
         "report_type": "dashboard",
         "root": None if censored else report.root,
         "generated_at": report.generated_at,
@@ -2022,6 +2495,9 @@ def build_json_report(report: UsageReport, *, censored: bool) -> dict:
             for key, value in sorted(report.sessions.items())
         },
     }
+    if report.claude is not None:
+        payload["claude"] = build_claude_json(report.claude, censored=censored)
+    return payload
 
 
 def build_focused_json_report(
@@ -2043,6 +2519,8 @@ def build_focused_json_report(
         "limits": asdict(report.limits) if report.limits is not None else None,
         "diagnostics": asdict(report.diagnostics),
     }
+    if report.claude is not None:
+        payload["claude"] = build_claude_json(report.claude, censored=censored)
     if command == "daily":
         rows = []
         for day_key in limited_rows(iter_daily_keys(report, reverse=True), limit):
@@ -2164,7 +2642,16 @@ def run_once(args: argparse.Namespace, ui: TerminalUI) -> UsageReport:
         progress=ui.update_progress if ui.enabled else None,
     )
     ui.finish_progress()
-    return build_report(root, since, until, events, diagnostics, pricing_metadata)
+    report = build_report(root, since, until, events, diagnostics, pricing_metadata)
+    if getattr(args, "claude", False):
+        report.claude = scan_claude_code_sessions(
+            claude_root=args.claude_root,
+            since=since,
+            until=until,
+            threshold=args.claude_threshold,
+            with_cost=not args.no_cost,
+        )
+    return report
 
 
 def render_plain_or_json(report: UsageReport, args: argparse.Namespace, ui: TerminalUI) -> str:
@@ -2182,8 +2669,9 @@ def render_plain_or_json(report: UsageReport, args: argparse.Namespace, ui: Term
         )
         return json.dumps(payload, indent=2, sort_keys=True)
 
-    if report.diagnostics.parsed_events == 0 and report.limits is None:
-        return "No local Codex usage found in the selected window."
+    has_claude_events = report.claude is not None and report.claude.diagnostics.parsed_events > 0
+    if report.diagnostics.parsed_events == 0 and report.limits is None and not has_claude_events:
+        return "No local Codex or Claude usage found in the selected window."
 
     if args.command == "daily":
         return render_daily_report(
