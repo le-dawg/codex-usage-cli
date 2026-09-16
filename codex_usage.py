@@ -175,7 +175,7 @@ class UsageEvent:
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return self.input_tokens + self.cached_input_tokens + self.output_tokens
 
 
 @dataclass
@@ -191,13 +191,14 @@ class Aggregate:
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return self.input_tokens + self.cached_input_tokens + self.output_tokens
 
     @property
     def cached_ratio(self) -> float:
-        if self.input_tokens <= 0:
+        total_in = self.input_tokens + self.cached_input_tokens
+        if total_in <= 0:
             return 0.0
-        return self.cached_input_tokens / self.input_tokens
+        return self.cached_input_tokens / total_in
 
     @property
     def estimated_emissions_g_co2e(self) -> float:
@@ -1047,10 +1048,10 @@ def estimate_cost_details(
         return None
     pricing, is_guess = resolved
     input_rate, output_rate, cached_rate = pricing
-    cached = max(0, min(cached_input_tokens, input_tokens))
-    non_cached = max(0, input_tokens - cached)
+    # input_tokens is uncached-only; cached_input_tokens is separate. Do NOT cap one
+    # against the other — in high-cache sessions cached >> uncached is correct.
     cache_read_rate = cached_rate if cached_rate is not None else input_rate
-    cost = non_cached * input_rate + cached * cache_read_rate + output_tokens * output_rate
+    cost = input_tokens * input_rate + cached_input_tokens * cache_read_rate + output_tokens * output_rate
     return cost, is_guess
 
 
@@ -1062,9 +1063,8 @@ def estimate_cost(model: str, input_tokens: int, cached_input_tokens: int, outpu
 def estimate_energy(model: str, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> float:
     multiplier = MODEL_ENERGY_MULTIPLIER.get(normalize_model(model), 1.0)
     input_rate, output_rate, cached_rate = (rate * multiplier for rate in BASE_ENERGY_RATES_WH)
-    cached = max(0, min(cached_input_tokens, input_tokens))
-    non_cached = max(0, input_tokens - cached)
-    return (non_cached * input_rate) + (cached * cached_rate) + (output_tokens * output_rate)
+    # input_tokens is uncached-only; cached_input_tokens is separate.
+    return (input_tokens * input_rate) + (cached_input_tokens * cached_rate) + (output_tokens * output_rate)
 
 
 def parse_local_day(timestamp: str) -> str | None:
@@ -1118,9 +1118,11 @@ def parse_session_file(
     events: list[UsageEvent] = []
     invalid_lines = 0
 
-    # Track token_usage_record events (newer format). When present we prefer them
-    # because thread_token_usage gives the authoritative cumulative session total,
-    # avoiding any double-counting risk from overlapping token_count events.
+    # token_usage_record (TUR) state — newer Codex format.
+    # We accumulate token_count deltas normally AND track the TUR cumulative.
+    # At end-of-file we compare both and use TUR if its totals exceed delta sum
+    # (TUR is authoritative for complete sessions; delta sum handles sessions
+    # that transition back to token_count mid-session due to client restarts).
     tur_last_thread: dict = {}
     tur_last_ts: str = ""
     tur_model: str | None = None
@@ -1165,11 +1167,6 @@ def parse_session_file(
 
             # ── Legacy format: event_msg / token_count ────────────────────────
             if item_type != "event_msg" or payload.get("type") != "token_count":
-                continue
-
-            # Skip token_count events when token_usage_record is also present —
-            # they can overlap and double-count tokens in archived sessions.
-            if has_tur:
                 continue
 
             info = payload.get("info") or {}
@@ -1231,35 +1228,79 @@ def parse_session_file(
     effective_session_id = session_id or fallback_session_id(path)
     session_title = (session_index.get(effective_session_id) or {}).get("thread_name")
 
-    # ── Emit synthetic event from token_usage_record cumulative total ─────────
+    # ── Reconcile TUR cumulative against token_count delta sum ────────────────
     if has_tur and tur_last_thread:
-        normalized_timestamp = normalize_local_timestamp(tur_last_ts) or ""
-        day = parse_local_day(normalized_timestamp) if normalized_timestamp else None
-        if day:
+        tur_input = as_int(tur_last_thread.get("input_tokens"))
+        tur_cached = as_int(tur_last_thread.get("cached_input_tokens", tur_last_thread.get("cache_read_input_tokens")))
+        tur_output = as_int(tur_last_thread.get("output_tokens"))
+
+        # Determine representative timestamp — prefer TUR timestamp, fall back to
+        # file modification time so sessions are never silently dropped.
+        tur_ts = normalize_local_timestamp(tur_last_ts) if tur_last_ts else None
+        if tur_ts is None:
+            try:
+                mtime = path.stat().st_mtime
+                tur_ts = epoch_to_local_timestamp(mtime)
+            except OSError:
+                pass
+
+        tur_day = parse_local_day(tur_ts) if tur_ts else None
+
+        # Compare TUR total against sum of delta events. Use TUR when its total
+        # exceeds the delta sum — it means the delta sum lost turns (e.g. overlapping
+        # cumulative snapshots or archived file covering a prior checkpoint). Use
+        # delta sum when it exceeds TUR total — meaning the session transitioned
+        # back to token_count events after the last TUR record.
+        delta_input = sum(e.input_tokens for e in events)
+        delta_cached = sum(e.cached_input_tokens for e in events)
+        delta_output = sum(e.output_tokens for e in events)
+
+        tur_total = tur_input + tur_cached + tur_output
+        delta_total = delta_input + delta_cached + delta_output
+
+        if tur_total > delta_total and tur_day and (tur_input > 0 or tur_cached > 0 or tur_output > 0):
             model = normalize_model(tur_model or current_model or "gpt-5")
-            input_tok = as_int(tur_last_thread.get("input_tokens"))
-            cached_tok = as_int(tur_last_thread.get("cached_input_tokens", tur_last_thread.get("cache_read_input_tokens")))
-            output_tok = as_int(tur_last_thread.get("output_tokens"))
-            if input_tok > 0 or cached_tok > 0 or output_tok > 0:
-                energy = estimate_energy(model, input_tok, cached_tok, output_tok)
-                cost_details = None if not with_cost else estimate_cost_details(model, input_tok, cached_tok, output_tok)
-                estimated = None if cost_details is None else cost_details[0]
-                events = [  # replace any partial token_count events collected before we saw a tur
-                    UsageEvent(
-                        session_id=effective_session_id,
-                        session_title=session_title,
-                        day=day,
-                        timestamp=normalized_timestamp,
-                        model=model,
-                        input_tokens=input_tok,
-                        cached_input_tokens=cached_tok,
-                        output_tokens=output_tok,
-                        plan_type=last_plan_type,
-                        estimated_energy_wh=energy,
-                        estimated_cost_usd=estimated,
-                        estimated_cost_is_guess=False if cost_details is None else cost_details[1],
-                    )
-                ]
+            energy = estimate_energy(model, tur_input, tur_cached, tur_output)
+            cost_details = None if not with_cost else estimate_cost_details(model, tur_input, tur_cached, tur_output)
+            estimated = None if cost_details is None else cost_details[0]
+            events = [
+                UsageEvent(
+                    session_id=effective_session_id,
+                    session_title=session_title,
+                    day=tur_day,
+                    timestamp=tur_ts or "",
+                    model=model,
+                    input_tokens=tur_input,
+                    cached_input_tokens=tur_cached,
+                    output_tokens=tur_output,
+                    plan_type=last_plan_type,
+                    estimated_energy_wh=energy,
+                    estimated_cost_usd=estimated,
+                    estimated_cost_is_guess=False if cost_details is None else cost_details[1],
+                )
+            ]
+        elif not events and tur_day and (tur_input > 0 or tur_cached > 0 or tur_output > 0):
+            # TUR-only session with no token_count events at all — always emit from TUR.
+            model = normalize_model(tur_model or current_model or "gpt-5")
+            energy = estimate_energy(model, tur_input, tur_cached, tur_output)
+            cost_details = None if not with_cost else estimate_cost_details(model, tur_input, tur_cached, tur_output)
+            estimated = None if cost_details is None else cost_details[0]
+            events = [
+                UsageEvent(
+                    session_id=effective_session_id,
+                    session_title=session_title,
+                    day=tur_day,
+                    timestamp=tur_ts or "",
+                    model=model,
+                    input_tokens=tur_input,
+                    cached_input_tokens=tur_cached,
+                    output_tokens=tur_output,
+                    plan_type=last_plan_type,
+                    estimated_energy_wh=energy,
+                    estimated_cost_usd=estimated,
+                    estimated_cost_is_guess=False if cost_details is None else cost_details[1],
+                )
+            ]
 
     return effective_session_id, session_title, events, invalid_lines
 
