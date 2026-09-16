@@ -1150,7 +1150,7 @@ def parse_session_file(
     try:
         with path.open() as check_handle:
             for line in check_handle:
-                if '"token_usage_record"' in line:
+                if '"token_usage_record"' in line and ('"usage":' in line or '"thread_token_usage":' in line) and not ('"usage":{}' in line and '"thread_token_usage":{}' in line):
                     has_tur = True
                     break
     except OSError:
