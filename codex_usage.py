@@ -1309,20 +1309,22 @@ def token_delta(
         cached_total = as_int(total_usage.get("cached_input_tokens", total_usage.get("cache_read_input_tokens")))
         output_total = as_int(total_usage.get("output_tokens"))
         if previous_totals is None:
-            input_delta, cached_delta, output_delta = input_total, cached_total, output_total
+            tot_p_delta = input_total
+            cached_delta = cached_total
+            uncached_delta = max(0, tot_p_delta - cached_delta)
+            output_delta = output_total
         else:
-            input_delta = max(0, input_total - previous_totals[0])
+            tot_p_delta = max(0, input_total - previous_totals[0])
             cached_delta = max(0, cached_total - previous_totals[1])
+            uncached_delta = max(0, tot_p_delta - cached_delta)
             output_delta = max(0, output_total - previous_totals[2])
-        # Note: cached_delta may exceed input_delta — that is correct. OpenAI reports
-        # input_tokens as uncached-only and cached_input_tokens separately, so in
-        # high-cache-hit turns cached tokens greatly outnumber uncached tokens.
-        return input_delta, cached_delta, output_delta, (input_total, cached_total, output_total)
+        return uncached_delta, cached_delta, output_delta, (input_total, cached_total, output_total)
 
-    input_delta = max(0, as_int(last_usage.get("input_tokens")))
+    tot_p = max(0, as_int(last_usage.get("input_tokens")))
     cached_delta = max(0, as_int(last_usage.get("cached_input_tokens", last_usage.get("cache_read_input_tokens"))))
+    uncached_delta = max(0, tot_p - cached_delta)
     output_delta = max(0, as_int(last_usage.get("output_tokens")))
-    return input_delta, cached_delta, output_delta, previous_totals
+    return uncached_delta, cached_delta, output_delta, previous_totals
 
 
 def collect_events(

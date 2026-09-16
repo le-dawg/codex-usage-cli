@@ -133,10 +133,62 @@ class TestTotalTokens(unittest.TestCase):
 
 class TestTokenDelta(unittest.TestCase):
 
+    def test_legacy_token_delta_uncached_subtraction(self):
+        """total_usage['input_tokens'] is total prompt (uncached + cached).
+        token_delta must return uncached prompt as input_delta."""
+        total_usage_1 = {
+            "input_tokens": 100_000,
+            "cached_input_tokens": 80_000,
+            "output_tokens": 1_000,
+        }
+        unc, cac, out, prev = token_delta(
+            total_usage=total_usage_1,
+            last_usage={},
+            previous_totals=None,
+        )
+        self.assertEqual(unc, 20_000)  # 100k total - 80k cached
+        self.assertEqual(cac, 80_000)
+        self.assertEqual(out, 1_000)
+        self.assertEqual(prev, (100_000, 80_000, 1_000))
+
+        # Turn 2: total grows to 150k input (120k cached), 2k output
+        total_usage_2 = {
+            "input_tokens": 150_000,
+            "cached_input_tokens": 120_000,
+            "output_tokens": 2_000,
+        }
+        unc2, cac2, out2, prev2 = token_delta(
+            total_usage=total_usage_2,
+            last_usage={},
+            previous_totals=prev,
+        )
+        # Delta total prompt = 50k, delta cached = 40k -> uncached = 10k
+        self.assertEqual(unc2, 10_000)
+        self.assertEqual(cac2, 40_000)
+        self.assertEqual(out2, 1_000)
+        self.assertEqual(prev2, (150_000, 120_000, 2_000))
+
+    def test_legacy_last_token_usage_uncached_subtraction(self):
+        """last_token_usage['input_tokens'] is total prompt (uncached + cached)."""
+        last_usage = {
+            "input_tokens": 50_000,
+            "cached_input_tokens": 45_000,
+            "output_tokens": 500,
+        }
+        unc, cac, out, prev = token_delta(
+            total_usage={},
+            last_usage=last_usage,
+            previous_totals=None,
+        )
+        self.assertEqual(unc, 5_000)  # 50k - 45k
+        self.assertEqual(cac, 45_000)
+        self.assertEqual(out, 500)
+
     def test_no_cap_when_cached_exceeds_uncached(self):
-        # Simulate a turn where cached_total >> input_total (common in high-cache sessions)
+        # Simulate a turn where cached_total >> uncached (common in high-cache sessions)
+        # input_tokens is total prompt: 5,010 total - 5,000 cached = 10 uncached
         input_delta, cached_delta, output_delta, _ = token_delta(
-            total_usage={"input_tokens": 10, "cached_input_tokens": 5_000, "output_tokens": 50},
+            total_usage={"input_tokens": 5_010, "cached_input_tokens": 5_000, "output_tokens": 50},
             last_usage={},
             previous_totals=None,
         )
@@ -146,20 +198,23 @@ class TestTokenDelta(unittest.TestCase):
 
     def test_delta_computation_with_previous_totals(self):
         prev = (100, 200, 50)
+        # Delta total prompt = 5,110 - 100 = 5,010. Delta cached = 5,200 - 200 = 5,000.
+        # Uncached delta = 5,010 - 5,000 = 10.
         input_delta, cached_delta, output_delta, new_totals = token_delta(
-            total_usage={"input_tokens": 110, "cached_input_tokens": 5_200, "output_tokens": 55},
+            total_usage={"input_tokens": 5_110, "cached_input_tokens": 5_200, "output_tokens": 55},
             last_usage={},
             previous_totals=prev,
         )
         self.assertEqual(input_delta, 10)
         self.assertEqual(cached_delta, 5_000)
         self.assertEqual(output_delta, 5)
-        self.assertEqual(new_totals, (110, 5_200, 55))
+        self.assertEqual(new_totals, (5_110, 5_200, 55))
 
     def test_last_usage_fallback_no_cap(self):
+        # input_tokens is total prompt: 3,005 total - 3,000 cached = 5 uncached
         input_delta, cached_delta, output_delta, totals = token_delta(
             total_usage={},
-            last_usage={"input_tokens": 5, "cached_input_tokens": 3_000, "output_tokens": 20},
+            last_usage={"input_tokens": 3_005, "cached_input_tokens": 3_000, "output_tokens": 20},
             previous_totals=None,
         )
         self.assertEqual(input_delta, 5)
