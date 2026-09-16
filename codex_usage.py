@@ -1118,6 +1118,14 @@ def parse_session_file(
     events: list[UsageEvent] = []
     invalid_lines = 0
 
+    # Track token_usage_record events (newer format). When present we prefer them
+    # because thread_token_usage gives the authoritative cumulative session total,
+    # avoiding any double-counting risk from overlapping token_count events.
+    tur_last_thread: dict = {}
+    tur_last_ts: str = ""
+    tur_model: str | None = None
+    has_tur = False
+
     with path.open() as handle:
         for line in handle:
             try:
@@ -1144,7 +1152,24 @@ def parse_session_file(
                 current_model = payload.get("model") or (payload.get("info") or {}).get("model") or current_model
                 continue
 
+            # ── Newer format: token_usage_record ──────────────────────────────
+            if item_type == "token_usage_record":
+                has_tur = True
+                thread = payload.get("thread_token_usage") or {}
+                if thread:
+                    tur_last_thread = thread
+                    tur_last_ts = item.get("timestamp", "")
+                    if not tur_model:
+                        tur_model = current_model
+                continue
+
+            # ── Legacy format: event_msg / token_count ────────────────────────
             if item_type != "event_msg" or payload.get("type") != "token_count":
+                continue
+
+            # Skip token_count events when token_usage_record is also present —
+            # they can overlap and double-count tokens in archived sessions.
+            if has_tur:
                 continue
 
             info = payload.get("info") or {}
@@ -1205,6 +1230,37 @@ def parse_session_file(
 
     effective_session_id = session_id or fallback_session_id(path)
     session_title = (session_index.get(effective_session_id) or {}).get("thread_name")
+
+    # ── Emit synthetic event from token_usage_record cumulative total ─────────
+    if has_tur and tur_last_thread:
+        normalized_timestamp = normalize_local_timestamp(tur_last_ts) or ""
+        day = parse_local_day(normalized_timestamp) if normalized_timestamp else None
+        if day:
+            model = normalize_model(tur_model or current_model or "gpt-5")
+            input_tok = as_int(tur_last_thread.get("input_tokens"))
+            cached_tok = as_int(tur_last_thread.get("cached_input_tokens", tur_last_thread.get("cache_read_input_tokens")))
+            output_tok = as_int(tur_last_thread.get("output_tokens"))
+            if input_tok > 0 or cached_tok > 0 or output_tok > 0:
+                energy = estimate_energy(model, input_tok, cached_tok, output_tok)
+                cost_details = None if not with_cost else estimate_cost_details(model, input_tok, cached_tok, output_tok)
+                estimated = None if cost_details is None else cost_details[0]
+                events = [  # replace any partial token_count events collected before we saw a tur
+                    UsageEvent(
+                        session_id=effective_session_id,
+                        session_title=session_title,
+                        day=day,
+                        timestamp=normalized_timestamp,
+                        model=model,
+                        input_tokens=input_tok,
+                        cached_input_tokens=cached_tok,
+                        output_tokens=output_tok,
+                        plan_type=last_plan_type,
+                        estimated_energy_wh=energy,
+                        estimated_cost_usd=estimated,
+                        estimated_cost_is_guess=False if cost_details is None else cost_details[1],
+                    )
+                ]
+
     return effective_session_id, session_title, events, invalid_lines
 
 
@@ -1224,12 +1280,15 @@ def token_delta(
             input_delta = max(0, input_total - previous_totals[0])
             cached_delta = max(0, cached_total - previous_totals[1])
             output_delta = max(0, output_total - previous_totals[2])
-        return input_delta, min(cached_delta, input_delta), output_delta, (input_total, cached_total, output_total)
+        # Note: cached_delta may exceed input_delta — that is correct. OpenAI reports
+        # input_tokens as uncached-only and cached_input_tokens separately, so in
+        # high-cache-hit turns cached tokens greatly outnumber uncached tokens.
+        return input_delta, cached_delta, output_delta, (input_total, cached_total, output_total)
 
     input_delta = max(0, as_int(last_usage.get("input_tokens")))
     cached_delta = max(0, as_int(last_usage.get("cached_input_tokens", last_usage.get("cache_read_input_tokens"))))
     output_delta = max(0, as_int(last_usage.get("output_tokens")))
-    return input_delta, min(cached_delta, input_delta), output_delta, previous_totals
+    return input_delta, cached_delta, output_delta, previous_totals
 
 
 def collect_events(
