@@ -780,7 +780,13 @@ def list_session_files(root: Path, since: date | None, until: date | None) -> li
     files: list[Path] = []
     yielded: set[Path] = set()
 
-    for path in iter_partitioned_files(sessions_root, since, until):
+    # Expand the scan partition window by 1 day on each end so that sessions active across
+    # UTC/local midnight boundaries or starting on an adjacent calendar day are discovered.
+    # Individual events are still strictly filtered by their exact local day in collect_events.
+    scan_since = since - timedelta(days=1) if since is not None else None
+    scan_until = until + timedelta(days=1) if until is not None else None
+
+    for path in iter_partitioned_files(sessions_root, scan_since, scan_until):
         files.append(path)
         yielded.add(path)
 
@@ -789,7 +795,7 @@ def list_session_files(root: Path, since: date | None, until: date | None) -> li
             if path in yielded:
                 continue
             day = day_from_filename(path.name)
-            if day is not None and since is not None and until is not None and (day < since or day > until):
+            if day is not None and scan_since is not None and scan_until is not None and (day < scan_since or day > scan_until):
                 continue
             files.append(path)
 
@@ -1042,7 +1048,19 @@ def estimate_cost_details(
     input_tokens: int,
     cached_input_tokens: int,
     output_tokens: int,
+    total_prompt: int | None = None,
 ) -> tuple[float, bool] | None:
+    normalized = normalize_model(model)
+    # Check if this is Azure GPT-5.4 with tiered long-context pricing (>272k context tokens)
+    effective_prompt = (input_tokens + cached_input_tokens) if total_prompt is None else total_prompt
+    if normalized == "gpt-5.4" and effective_prompt > DEFAULT_CLAUDE_CONTEXT_THRESHOLD:
+        cost = (
+            input_tokens * AZURE_GPT54_EU_LONG_RATES[0]
+            + cached_input_tokens * AZURE_GPT54_EU_LONG_RATES[2]
+            + output_tokens * AZURE_GPT54_EU_LONG_RATES[1]
+        )
+        return cost, False
+
     resolved = resolve_pricing(model)
     if resolved is None:
         return None
@@ -1055,8 +1073,14 @@ def estimate_cost_details(
     return cost, is_guess
 
 
-def estimate_cost(model: str, input_tokens: int, cached_input_tokens: int, output_tokens: int) -> float | None:
-    estimated = estimate_cost_details(model, input_tokens, cached_input_tokens, output_tokens)
+def estimate_cost(
+    model: str,
+    input_tokens: int,
+    cached_input_tokens: int,
+    output_tokens: int,
+    total_prompt: int | None = None,
+) -> float | None:
+    estimated = estimate_cost_details(model, input_tokens, cached_input_tokens, output_tokens, total_prompt)
     return None if estimated is None else estimated[0]
 
 
@@ -1118,15 +1142,19 @@ def parse_session_file(
     events: list[UsageEvent] = []
     invalid_lines = 0
 
-    # token_usage_record (TUR) state — newer Codex format.
-    # We accumulate token_count deltas normally AND track the TUR cumulative.
-    # At end-of-file we compare both and use TUR if its totals exceed delta sum
-    # (TUR is authoritative for complete sessions; delta sum handles sessions
-    # that transition back to token_count mid-session due to client restarts).
-    tur_last_thread: dict = {}
-    tur_last_ts: str = ""
-    tur_model: str | None = None
+    # First pass or detection: check if file has token_usage_record (TUR) events.
+    # When TUR events are present, they provide authoritative per-turn usage in payload["usage"].
+    # We skip token_count events entirely in TUR files to prevent double-counting and avoid
+    # cumulative baseline inflation from continuation files.
     has_tur = False
+    try:
+        with path.open() as check_handle:
+            for line in check_handle:
+                if '"token_usage_record"' in line:
+                    has_tur = True
+                    break
+    except OSError:
+        pass
 
     with path.open() as handle:
         for line in handle:
@@ -1154,19 +1182,59 @@ def parse_session_file(
                 current_model = payload.get("model") or (payload.get("info") or {}).get("model") or current_model
                 continue
 
-            # ── Newer format: token_usage_record ──────────────────────────────
+            # ── Modern format: token_usage_record (per-turn usage) ────────────
             if item_type == "token_usage_record":
-                has_tur = True
-                thread = payload.get("thread_token_usage") or {}
-                if thread:
-                    tur_last_thread = thread
-                    tur_last_ts = item.get("timestamp", "")
-                    if not tur_model:
-                        tur_model = current_model
+                usage = payload.get("usage") or payload.get("thread_token_usage") or {}
+                total_prompt = as_int(usage.get("input_tokens"))
+                cached_in = as_int(usage.get("cached_input_tokens") or usage.get("cache_read_input_tokens"))
+                uncached_in = max(0, total_prompt - cached_in)
+                output_tokens = as_int(usage.get("output_tokens"))
+
+                if uncached_in == 0 and cached_in == 0 and output_tokens == 0:
+                    continue
+
+                ts = normalize_local_timestamp(item.get("timestamp", ""))
+                if ts is None:
+                    try:
+                        ts = epoch_to_local_timestamp(path.stat().st_mtime)
+                    except OSError:
+                        pass
+                day = parse_local_day(ts) if ts else None
+                if not day:
+                    continue
+
+                effective_session_id = session_id or fallback_session_id(path)
+                session_title = (session_index.get(effective_session_id) or {}).get("thread_name")
+                model_name = normalize_model(current_model or "gpt-5.4")
+                energy = estimate_energy(model_name, uncached_in, cached_in, output_tokens)
+                cost_details = (
+                    None
+                    if not with_cost
+                    else estimate_cost_details(model_name, uncached_in, cached_in, output_tokens, total_prompt=total_prompt)
+                )
+                cost_val = None if cost_details is None else cost_details[0]
+
+                events.append(
+                    UsageEvent(
+                        session_id=effective_session_id,
+                        session_title=session_title,
+                        day=day,
+                        timestamp=ts or "",
+                        model=model_name,
+                        input_tokens=uncached_in,
+                        cached_input_tokens=cached_in,
+                        output_tokens=output_tokens,
+                        plan_type=last_plan_type,
+                        estimated_energy_wh=energy,
+                        estimated_cost_usd=cost_val,
+                        estimated_cost_is_guess=False if cost_details is None else cost_details[1],
+                    )
+                )
                 continue
 
             # ── Legacy format: event_msg / token_count ────────────────────────
-            if item_type != "event_msg" or payload.get("type") != "token_count":
+            # If the session file contains TUR records, skip token_count events completely.
+            if has_tur or item_type != "event_msg" or payload.get("type") != "token_count":
                 continue
 
             info = payload.get("info") or {}
@@ -1227,81 +1295,6 @@ def parse_session_file(
 
     effective_session_id = session_id or fallback_session_id(path)
     session_title = (session_index.get(effective_session_id) or {}).get("thread_name")
-
-    # ── Reconcile TUR cumulative against token_count delta sum ────────────────
-    if has_tur and tur_last_thread:
-        tur_input = as_int(tur_last_thread.get("input_tokens"))
-        tur_cached = as_int(tur_last_thread.get("cached_input_tokens", tur_last_thread.get("cache_read_input_tokens")))
-        tur_output = as_int(tur_last_thread.get("output_tokens"))
-
-        # Determine representative timestamp — prefer TUR timestamp, fall back to
-        # file modification time so sessions are never silently dropped.
-        tur_ts = normalize_local_timestamp(tur_last_ts) if tur_last_ts else None
-        if tur_ts is None:
-            try:
-                mtime = path.stat().st_mtime
-                tur_ts = epoch_to_local_timestamp(mtime)
-            except OSError:
-                pass
-
-        tur_day = parse_local_day(tur_ts) if tur_ts else None
-
-        # Compare TUR total against sum of delta events. Use TUR when its total
-        # exceeds the delta sum — it means the delta sum lost turns (e.g. overlapping
-        # cumulative snapshots or archived file covering a prior checkpoint). Use
-        # delta sum when it exceeds TUR total — meaning the session transitioned
-        # back to token_count events after the last TUR record.
-        delta_input = sum(e.input_tokens for e in events)
-        delta_cached = sum(e.cached_input_tokens for e in events)
-        delta_output = sum(e.output_tokens for e in events)
-
-        tur_total = tur_input + tur_cached + tur_output
-        delta_total = delta_input + delta_cached + delta_output
-
-        if tur_total > delta_total and tur_day and (tur_input > 0 or tur_cached > 0 or tur_output > 0):
-            model = normalize_model(tur_model or current_model or "gpt-5")
-            energy = estimate_energy(model, tur_input, tur_cached, tur_output)
-            cost_details = None if not with_cost else estimate_cost_details(model, tur_input, tur_cached, tur_output)
-            estimated = None if cost_details is None else cost_details[0]
-            events = [
-                UsageEvent(
-                    session_id=effective_session_id,
-                    session_title=session_title,
-                    day=tur_day,
-                    timestamp=tur_ts or "",
-                    model=model,
-                    input_tokens=tur_input,
-                    cached_input_tokens=tur_cached,
-                    output_tokens=tur_output,
-                    plan_type=last_plan_type,
-                    estimated_energy_wh=energy,
-                    estimated_cost_usd=estimated,
-                    estimated_cost_is_guess=False if cost_details is None else cost_details[1],
-                )
-            ]
-        elif not events and tur_day and (tur_input > 0 or tur_cached > 0 or tur_output > 0):
-            # TUR-only session with no token_count events at all — always emit from TUR.
-            model = normalize_model(tur_model or current_model or "gpt-5")
-            energy = estimate_energy(model, tur_input, tur_cached, tur_output)
-            cost_details = None if not with_cost else estimate_cost_details(model, tur_input, tur_cached, tur_output)
-            estimated = None if cost_details is None else cost_details[0]
-            events = [
-                UsageEvent(
-                    session_id=effective_session_id,
-                    session_title=session_title,
-                    day=tur_day,
-                    timestamp=tur_ts or "",
-                    model=model,
-                    input_tokens=tur_input,
-                    cached_input_tokens=tur_cached,
-                    output_tokens=tur_output,
-                    plan_type=last_plan_type,
-                    estimated_energy_wh=energy,
-                    estimated_cost_usd=estimated,
-                    estimated_cost_is_guess=False if cost_details is None else cost_details[1],
-                )
-            ]
-
     return effective_session_id, session_title, events, invalid_lines
 
 
@@ -1340,7 +1333,7 @@ def collect_events(
     progress: Callable[[int, int, Path], None] | None = None,
 ) -> tuple[list[UsageEvent], ScanDiagnostics]:
     session_index = load_session_index(root)
-    seen_session_ids: set[str] = set()
+    seen_file_paths: set[Path] = set()
     diagnostics = ScanDiagnostics()
     files = list_session_files(root, since, until)
     diagnostics.discovered_files = len(files)
@@ -1349,14 +1342,15 @@ def collect_events(
     for index, path in enumerate(files, start=1):
         if progress:
             progress(index, diagnostics.discovered_files, path)
+        canonical_path = path.resolve()
+        if canonical_path in seen_file_paths:
+            diagnostics.duplicate_session_files += 1
+            continue
+        seen_file_paths.add(canonical_path)
+
         session_id, _, events, invalid_lines = parse_session_file(path, session_index, with_cost=with_cost)
         diagnostics.scanned_files += 1
         diagnostics.invalid_lines += invalid_lines
-
-        if session_id in seen_session_ids:
-            diagnostics.duplicate_session_files += 1
-            continue
-        seen_session_ids.add(session_id)
 
         if not events:
             diagnostics.empty_sessions += 1

@@ -184,8 +184,8 @@ class TestTURMissingTimestamp(unittest.TestCase):
                     "type": "token_usage_record",
                     # no "timestamp" key at all
                     "payload": {
-                        "thread_token_usage": {
-                            "input_tokens": 100,
+                        "usage": {
+                            "input_tokens": 600,
                             "cached_input_tokens": 500,
                             "output_tokens": 50,
                         }
@@ -198,13 +198,13 @@ class TestTURMissingTimestamp(unittest.TestCase):
             # Session must NOT be silently dropped
             self.assertGreater(len(events), 0, "Session with TUR but no timestamp should not be dropped")
             ev = events[0]
-            self.assertEqual(ev.input_tokens, 100)
+            self.assertEqual(ev.input_tokens, 100)  # 600 total - 500 cached
             self.assertEqual(ev.cached_input_tokens, 500)
             self.assertEqual(ev.output_tokens, 50)
 
 
 # ---------------------------------------------------------------------------
-# 4b. Mixed event types — TUR total vs delta sum comparison
+# 4b. Mixed and Per-Turn Event Types
 # ---------------------------------------------------------------------------
 
 class TestMixedEventTypes(unittest.TestCase):
@@ -225,12 +225,12 @@ class TestMixedEventTypes(unittest.TestCase):
             },
         }
 
-    def _tur_event(self, ts: str, input_tok: int, cached_tok: int, output_tok: int) -> dict:
+    def _tur_turn_event(self, ts: str, input_tok: int, cached_tok: int, output_tok: int) -> dict:
         return {
             "type": "token_usage_record",
             "timestamp": ts,
             "payload": {
-                "thread_token_usage": {
+                "usage": {
                     "input_tokens": input_tok,
                     "cached_input_tokens": cached_tok,
                     "output_tokens": output_tok,
@@ -238,63 +238,42 @@ class TestMixedEventTypes(unittest.TestCase):
             },
         }
 
-    def test_tur_greater_than_delta_uses_tur(self):
-        """TUR has more total tokens than delta sum → use TUR (authoritative for complete session)."""
+    def test_tur_file_emits_per_turn_events(self):
+        """Files with TUR emit discrete per-turn UsageEvents based on payload['usage']."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "rollout-2026-09-16T10-00-00-aaa111.jsonl"
             lines = [
-                # 2 token_count events (delta total = 50+500+10 + 80+1000+20 = 1660)
-                self._token_count_event("2026-09-16T10:00:00Z", 50, 500, 10),
-                self._token_count_event("2026-09-16T10:05:00Z", 130, 1500, 30),
-                # TUR with higher cumulative (2000 total > 1660 delta)
-                self._tur_event("2026-09-16T10:10:00Z", 200, 1700, 100),
+                self._tur_turn_event("2026-09-16T10:00:00Z", 200, 150, 20),
+                self._tur_turn_event("2026-09-16T10:05:00Z", 300, 250, 30),
             ]
             _make_session_jsonl(lines, path)
 
             sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
-            self.assertEqual(len(events), 1)
-            ev = events[0]
-            # Should use TUR values
-            self.assertEqual(ev.input_tokens, 200)
-            self.assertEqual(ev.cached_input_tokens, 1700)
-            self.assertEqual(ev.output_tokens, 100)
+            self.assertEqual(len(events), 2)
+            # Turn 1: 200 prompt - 150 cached = 50 uncached
+            self.assertEqual(events[0].input_tokens, 50)
+            self.assertEqual(events[0].cached_input_tokens, 150)
+            self.assertEqual(events[0].output_tokens, 20)
+            # Turn 2: 300 prompt - 250 cached = 50 uncached
+            self.assertEqual(events[1].input_tokens, 50)
+            self.assertEqual(events[1].cached_input_tokens, 250)
+            self.assertEqual(events[1].output_tokens, 30)
 
-    def test_delta_greater_than_tur_keeps_deltas(self):
-        """Delta sum exceeds TUR total (session continued with token_count after TUR) → keep deltas."""
+    def test_tur_presence_skips_token_count_double_counting(self):
+        """When TUR is present, token_count events are skipped to avoid multi-counting."""
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "rollout-2026-09-16T10-00-00-bbb222.jsonl"
             lines = [
-                # TUR mid-session (small cumulative)
-                self._tur_event("2026-09-16T10:05:00Z", 50, 200, 20),
-                # Additional token_count events AFTER TUR (session continued)
-                self._token_count_event("2026-09-16T10:06:00Z", 100, 500, 50),
-                self._token_count_event("2026-09-16T10:07:00Z", 300, 2000, 150),
-            ]
-            _make_session_jsonl(lines, path)
-
-            sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
-            # Delta sum (100+500+50 + 200+1500+100 = 2450) > TUR total (270)
-            # → keep the delta events, do not replace with TUR
-            total_toks = sum(e.input_tokens + e.cached_input_tokens + e.output_tokens for e in events)
-            self.assertGreater(total_toks, 270,
-                               "Expected delta sum to be used when it exceeds TUR total")
-
-    def test_tur_only_session_emits_event(self):
-        """Session with ONLY token_usage_record events, no token_count at all."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "rollout-2026-09-16T10-00-00-ccc333.jsonl"
-            lines = [
-                self._tur_event("2026-09-16T10:00:00Z", 1000, 5000, 200),
-                self._tur_event("2026-09-16T10:10:00Z", 1500, 8000, 350),  # last TUR wins
+                self._tur_turn_event("2026-09-16T10:00:00Z", 100, 80, 10),
+                self._token_count_event("2026-09-16T10:00:00Z", 100, 80, 10),
             ]
             _make_session_jsonl(lines, path)
 
             sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
             self.assertEqual(len(events), 1)
-            ev = events[0]
-            self.assertEqual(ev.input_tokens, 1500)
-            self.assertEqual(ev.cached_input_tokens, 8000)
-            self.assertEqual(ev.output_tokens, 350)
+            self.assertEqual(events[0].input_tokens, 20)  # 100 - 80
+            self.assertEqual(events[0].cached_input_tokens, 80)
+            self.assertEqual(events[0].output_tokens, 10)
 
 
 if __name__ == "__main__":
