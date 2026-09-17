@@ -1144,15 +1144,67 @@ def parse_session_file(
 
     # First pass or detection: check if file has token_usage_record (TUR) events.
     # When TUR events are present, they provide authoritative per-turn usage in payload["usage"].
-    # We skip token_count events entirely in TUR files to prevent double-counting and avoid
-    # cumulative baseline inflation from continuation files.
-    has_tur = False
+    # We skip companion token_count events (from first_tur_ts onwards) to prevent double-counting.
+    first_tur_ts: datetime | None = None
     try:
         with path.open() as check_handle:
             for line in check_handle:
                 if '"token_usage_record"' in line and ('"usage":' in line or '"thread_token_usage":' in line) and not ('"usage":{}' in line and '"thread_token_usage":{}' in line):
-                    has_tur = True
-                    break
+                    try:
+                        item = json.loads(line)
+                        if item.get("type") == "token_usage_record":
+                            ts_str = item.get("timestamp", "")
+                            dt = parse_local_timestamp(ts_str)
+                            if dt is None:
+                                try:
+                                    dt = parse_local_timestamp(epoch_to_local_timestamp(path.stat().st_mtime))
+                                except OSError:
+                                    pass
+                            first_tur_ts = dt
+                            break
+                    except Exception:
+                        pass
+    except OSError:
+        pass
+
+    # Startup replay burst detection for legacy session/rollout files:
+    # Subagents or continuation sessions dump the parent thread's prior turns as initial state
+    # at file creation within milliseconds. If an initial burst of > 5 token_count events occurs
+    # within <= 1.0s of the first token_count event, treat the burst as an inherited history
+    # baseline and initialize previous_totals to the burst's final cumulative totals so parent
+    # history is not re-accumulated as new token deltas.
+    burst_count = 0
+    try:
+        with path.open() as check_handle:
+            burst_candidates: list[dict] = []
+            t0: datetime | None = None
+            for line in check_handle:
+                if '"token_count"' in line and '"event_msg"' in line:
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if item.get("type") == "event_msg" and (item.get("payload") or {}).get("type") == "token_count":
+                        info = (item.get("payload") or {}).get("info") or {}
+                        tot = info.get("total_token_usage") or info.get("last_token_usage") or {}
+                        ts_str = item.get("timestamp", "")
+                        dt = parse_local_timestamp(ts_str)
+                        if dt and tot:
+                            if t0 is None:
+                                t0 = dt
+                                burst_candidates.append(tot)
+                            elif abs((dt - t0).total_seconds()) <= 1.0:
+                                burst_candidates.append(tot)
+                            else:
+                                break
+            if len(burst_candidates) > 5:
+                burst_count = len(burst_candidates)
+                last_tot = burst_candidates[-1]
+                previous_totals = (
+                    as_int(last_tot.get("input_tokens")),
+                    as_int(last_tot.get("cached_input_tokens", last_tot.get("cache_read_input_tokens"))),
+                    as_int(last_tot.get("output_tokens")),
+                )
     except OSError:
         pass
 
@@ -1233,8 +1285,13 @@ def parse_session_file(
                 continue
 
             # ── Legacy format: event_msg / token_count ────────────────────────
-            # If the session file contains TUR records, skip token_count events completely.
-            if has_tur or item_type != "event_msg" or payload.get("type") != "token_count":
+            if item_type != "event_msg" or payload.get("type") != "token_count":
+                continue
+
+            # If TUR is active (present for this or prior turns), skip token_count to prevent double-counting.
+            raw_ts = item.get("timestamp", "")
+            parsed_ts = parse_local_timestamp(raw_ts)
+            if first_tur_ts and parsed_ts and parsed_ts >= first_tur_ts:
                 continue
 
             info = payload.get("info") or {}
@@ -1261,6 +1318,11 @@ def parse_session_file(
             plan_type = (payload.get("rate_limits") or {}).get("plan_type") or last_plan_type
             if plan_type:
                 last_plan_type = plan_type
+
+            # Filter out startup history replay bursts:
+            if burst_count > 0:
+                burst_count -= 1
+                continue
 
             input_delta, cached_delta, output_delta, previous_totals = token_delta(
                 total_usage=total_usage,

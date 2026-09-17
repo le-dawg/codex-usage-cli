@@ -330,6 +330,164 @@ class TestMixedEventTypes(unittest.TestCase):
             self.assertEqual(events[0].cached_input_tokens, 80)
             self.assertEqual(events[0].output_tokens, 10)
 
+    def test_hybrid_transition_token_count_to_tur(self):
+        """When a session begins with legacy token_count events and transitions to TUR,
+        legacy turns before TUR emit delta events, and modern turns emit TUR events
+        while skipping companion token_count events."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout-2026-08-25T10-00-00-hybrid.jsonl"
+            lines = [
+                # Turn 1: legacy token_count only
+                self._token_count_event("2026-08-25T10:00:00Z", 50_000, 40_000, 500),
+                # Turn 2: legacy token_count only (5 minutes later)
+                self._token_count_event("2026-08-25T10:05:00Z", 100_000, 80_000, 1_000),
+                # Turn 3: resumed weeks later with TUR + companion token_count
+                self._tur_turn_event("2026-09-10T14:00:00Z", 60_000, 50_000, 600),
+                self._token_count_event("2026-09-10T14:00:00Z", 160_000, 130_000, 1_600),
+            ]
+            _make_session_jsonl(lines, path)
+
+            sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
+            # Must have 3 events total (2 from legacy token_count, 1 from TUR)
+            self.assertEqual(len(events), 3)
+
+            # Turn 1 (legacy): 50k input - 40k cached = 10k uncached
+            self.assertEqual(events[0].input_tokens, 10_000)
+            self.assertEqual(events[0].cached_input_tokens, 40_000)
+            self.assertEqual(events[0].output_tokens, 500)
+            self.assertEqual(events[0].day, "2026-08-25")
+
+            # Turn 2 (legacy delta): (100k - 50k) - (80k - 40k) = 10k uncached
+            self.assertEqual(events[1].input_tokens, 10_000)
+            self.assertEqual(events[1].cached_input_tokens, 40_000)
+            self.assertEqual(events[1].output_tokens, 500)
+            self.assertEqual(events[1].day, "2026-08-25")
+
+            # Turn 3 (TUR): 60k input - 50k cached = 10k uncached
+            self.assertEqual(events[2].input_tokens, 10_000)
+            self.assertEqual(events[2].cached_input_tokens, 50_000)
+            self.assertEqual(events[2].output_tokens, 600)
+            self.assertEqual(events[2].day, "2026-09-10")
+
+
+
+# ---------------------------------------------------------------------------
+# 5. Startup history replay burst filtering in subagent rollout files
+# ---------------------------------------------------------------------------
+
+class TestSubagentStartupReplay(unittest.TestCase):
+
+    def test_subagent_startup_replay_filtered(self):
+        """When a subagent rollout file dumps 10 historical turns at startup within milliseconds,
+        it should not re-accumulate the parent's history as new tokens."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout-2026-08-25T15-52-34-subagent.jsonl"
+            lines = [
+                {"type": "session_meta", "payload": {"id": "subagent-1", "parent_id": "parent-1"}},
+            ]
+            # 10 historical burst events at exact same startup millisecond
+            for i in range(1, 11):
+                lines.append({
+                    "type": "event_msg",
+                    "timestamp": "2026-08-25T15:52:34.400Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": i * 10_000,
+                                "cached_input_tokens": i * 8_000,
+                                "output_tokens": i * 100,
+                            }
+                        }
+                    }
+                })
+            # 1 real turn executed 10 seconds later
+            lines.append({
+                "type": "event_msg",
+                "timestamp": "2026-08-25T15:52:44.000Z",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 105_000,
+                            "cached_input_tokens": 84_000,
+                            "output_tokens": 1_050,
+                        }
+                    }
+                }
+            })
+            _make_session_jsonl(lines, path)
+
+            sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
+            # Only the single real turn executed post-startup should be recorded
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].input_tokens, 1_000)  # (105k - 100k) - (84k - 80k) = 5k - 4k = 1k
+            self.assertEqual(events[0].cached_input_tokens, 4_000)
+            self.assertEqual(events[0].output_tokens, 50)
+
+    def test_subagent_startup_replay_only_no_real_turns(self):
+        """When a subagent rollout file only contains the startup replay burst,
+        zero synthetic events should be emitted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout-2026-08-25T15-52-34-replay-only.jsonl"
+            lines = [
+                {"type": "session_meta", "payload": {"id": "subagent-dead", "parent_id": "parent-1"}},
+            ]
+            for i in range(1, 8):
+                lines.append({
+                    "type": "event_msg",
+                    "timestamp": "2026-08-25T15:52:34.400Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": i * 10_000,
+                                "cached_input_tokens": i * 8_000,
+                                "output_tokens": i * 100,
+                            }
+                        }
+                    }
+                })
+            _make_session_jsonl(lines, path)
+
+            sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
+            self.assertEqual(len(events), 0)
+
+    def test_fast_session_under_burst_threshold_not_filtered(self):
+        """When a normal fast session has <= 5 turns within 1 second,
+        it should not be filtered as a replay burst."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rollout-2026-08-25T15-52-34-fast.jsonl"
+            lines = [
+                {"type": "session_meta", "payload": {"id": "fast-1"}},
+            ]
+            for i in range(1, 4):  # 3 turns
+                lines.append({
+                    "type": "event_msg",
+                    "timestamp": "2026-08-25T15:52:34.400Z",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": i * 1_000,
+                                "cached_input_tokens": i * 800,
+                                "output_tokens": i * 50,
+                            }
+                        }
+                    }
+                })
+            _make_session_jsonl(lines, path)
+
+            sid, title, events, _ = parse_session_file(path, {}, with_cost=False)
+            # All 3 turns should be preserved
+            self.assertEqual(len(events), 3)
+            for ev in events:
+                self.assertEqual(ev.input_tokens, 200)
+                self.assertEqual(ev.cached_input_tokens, 800)
+                self.assertEqual(ev.output_tokens, 50)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
